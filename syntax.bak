@@ -1,0 +1,115 @@
+#lang racket
+(provide (all-defined-out))
+
+;; Any -> Boolean
+;; Is x a well-formed expression?
+(define (expr? x)
+  (match x
+    [(? integer? i) #t]
+    [(? boolean? b) #t]
+    [(? char? c) #t]
+    [(? string? s) #t]
+    [(? empty? e) #t]
+    [(? symbol? s) (valid-variable s)]
+    [`(if ,x ,y ,z)
+     (and (expr? x)
+          (expr? y)
+          (expr? z))]
+    [`(,(? prim1?) ,x) (expr? x)]
+    [`(,(? prim2?) ,x ,y) (and (expr? x) (expr? y))]
+    [(list 'cond `(,xs ,ys) ... `(else ,z))
+     (and (andmap expr? xs)
+          (andmap expr? ys)
+          (expr? z))]
+    [`(let ,(list bs ...) ,e)
+     (and (check-let-bindings bs)
+          (expr? e))]
+    [_ #f]))
+
+;; (Listof (Variable Expr)) -> Boolean
+(define (check-let-bindings bs)
+  (match bs
+    ['() #t]
+    [(cons (list b e) bs)
+     (and (valid-variable b)
+          (expr? e)
+          (check-let-bindings bs))]
+    [_ #f]))
+
+;; Symbol -> Boolean
+(define (valid-variable s)
+  (and (symbol? s) (not (memq s '(add1 sub1 abs - integer->char char->integer
+                      car cdr length                      
+                      char? integer? boolean? zero? string? box? empty? cons? box unbox car cdr string-length + cons
+                 - make-string string-ref = <= < char=? boolean=? + cons let cond if)))));
+
+
+
+
+
+;; Expr -> Boolean
+;; Is e a closed expression?
+(define (closed? e)
+  (closed-env? e '()))
+
+(define (closed-env? e env)
+  (match e
+    [(? integer? i) #t]
+    [(? boolean? b) #t]
+    [(? char? c) #t]
+    [(? string? s) #t]
+    [(? symbol? s) (not (not (memq s env)))]
+    [`(if ,x ,y ,z)
+     (and (closed-env? x env)
+          (closed-env? y env)
+          (closed-env? z env))]
+    [`(,(? prim1?) ,x) (closed-env? x env)]
+    [`(,(? prim2?) ,x ,y) (and (closed-env? x env) (closed-env? y env))]
+    [(list 'cond `(,xs ,ys) ... `(else ,z))
+     (and (closed-clauses? xs env)
+          (closed-clauses? ys env)
+          (closed-env? z env))]
+    [`(let ,(list bs ...) ,e)
+     (and (check-bindings bs env)
+          (closed-env? e (add-vars bs env)))]
+    [_ #f]))
+
+;; (Listof (Bindings)) (Listof (Variables)) -> Boolean
+(define (check-bindings bs env)
+  (match bs
+    ['() #t]
+    [(cons (list v e) bs) (and (not (memq v env))
+                               (closed-env? e env)
+                               (check-bindings bs env))]))
+
+;; (Listof (Bindings)) (Listof (Variables)) -> (Listof (Variables))
+(define (add-vars bs env)
+  (match bs
+    ['() env]
+    [(cons (list v e) bs) (add-vars bs (append (list v) env))]))
+
+(define (closed-clauses? cs env)
+  (match cs
+    ['() #t]
+    [(cons e0 cs) (and (closed-env? e0 env)
+                       (closed-clauses? cs env))]))
+
+;; Any -> Boolean
+;; Is x a unary primitive?
+(define (prim1? x)
+  (and (symbol? x)
+       (memq x '(add1 sub1 abs - integer->char char->integer
+                      car cdr length                      
+                      char? integer? boolean? zero? string? box? empty? cons? box unbox car cdr string-length))))
+
+;; Any -> Boolean
+;; Is x a binary primitive?
+(define (prim2? x)
+  (and (symbol? x)
+       (memq x '(+
+                 cons
+                 - make-string string-ref = < <= char=? boolean=? + cons))))
+
+
+
+

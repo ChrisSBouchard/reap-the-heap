@@ -1,0 +1,624 @@
+#lang racket
+(provide (all-defined-out))
+
+;; An immediate is anything ending in #b0000
+;; All other tags in mask #b111 are pointers
+
+(define result-shift     3)
+(define result-type-mask (sub1 (arithmetic-shift 1 result-shift)))
+(define type-imm         #b000)
+(define type-box         #b001)
+(define type-pair        #b010)
+(define type-string      #b011)
+
+(define imm-shift        (+ 2 result-shift))
+(define imm-type-mask    (sub1 (arithmetic-shift 1 imm-shift)))
+(define imm-type-int     (arithmetic-shift #b00 result-shift))
+(define imm-type-bool    (arithmetic-shift #b01 result-shift))
+(define imm-type-char    (arithmetic-shift #b10 result-shift))
+(define imm-type-empty   (arithmetic-shift #b11 result-shift))
+
+(define imm-val-false    imm-type-bool)
+(define imm-val-true     (bitwise-ior (arithmetic-shift 1 (add1 imm-shift)) imm-type-bool))
+
+;; Allocate in 64-bit (8-byte) increments, so pointers
+;; end in #b000 and we tag with #b001 for boxes, etc.
+
+;; type CEnv = (Listof (Maybe Variable))
+;; type Imm = Integer | Boolean | Char | '()
+
+;; Expr -> Asm
+(define (compile e)
+  `(entry
+    ,@(compile-e e '())
+    ret
+    err
+    (push rbp)
+    (call error)
+    ret))
+
+;; Expr CEnv -> Asm
+(define (compile-e e c)
+  (match e
+    [(? imm? i)                       (compile-imm i)]
+    [(? symbol? x)                    (compile-var x c)]
+    [(? string? s)                    (compile-string s)]
+    [`(box ,e0)                       (compile-box e0 c)]
+    [`(unbox ,e0)                     (compile-unbox e0 c)]
+    [`(cons ,e0 ,e1)                  (compile-cons e0 e1 c)]
+    [`(car ,e0)                       (compile-car e0 c)]
+    [`(cdr ,e0)                       (compile-cdr e0 c)]
+    [`(add1 ,e0)                      (compile-add1 e0 c)]
+    [`(sub1 ,e0)                      (compile-sub1 e0 c)]
+    [`(zero? ,e0)                     (compile-zero? e0 c)]
+    [`(if ,e0 ,e1 ,e2)                (compile-if e0 e1 e2 c)]
+    [`(+ ,e0 ,e1)                     (compile-+ e0 e1 c)]
+    [`(- ,e0)                         (compile--1 e0 c)]
+    [`(- ,e0 ,e1)                     (compile--2 e0 e1 c)]
+    [`(abs, e0)                       (compile-abs e0 c)]
+    [`(integer? ,e0)                  (compile-integer? e0 c)]
+    [`(boolean? ,e0)                  (compile-boolean? e0 c)]
+    [`(char? ,e0)                     (compile-char? e0 c)]
+    [`(integer->char ,e0)             (compile-integer->char e0 c)]
+    [`(char->integer ,e0)             (compile-char->integer e0 c)]
+    [`(let ,(list bs ...) ,e0)        (compile-bindings bs e0 c)]
+    [`(let* ,(list bs ...) ,e0)       (compile-bindings bs e0 c)]
+    [(list 'cond cs ... `(else ,en))  (compile-cond-env cs en c)]
+    [`(string? ,e0)                   (compile-string? e0 c)]
+    [`(string-ref ,e0 ,e1)            (compile-string-ref e0 e1 c)]
+    [`(string-length ,e0)             (compile-string-length e0 c)]
+    [`(make-string ,e0 ,e1)           (compile-make-string e0 e1 c)]
+    [`(box? ,e0)                      (compile-box? e0 c)]
+    [`(empty? ,e0)                    (compile-empty? e0 c)]
+    [`(cons? ,e0)                     (compile-cons? e0 c)]
+    [`(= ,e0 ,e1)                     (compile-= e0 e1 c)]
+    [`(< ,e0 ,e1)                     (compile-< e0 e1 c)]
+    [`(<= ,e0 ,e1)                    (compile-<= e0 e1 c)]
+    [`(char=? ,e0 ,e1)                (compile-char=? e0 e1 c)]
+    [`(boolean=? ,e0 ,e1)             (compile-boolean=? e0 e1 c)]))
+
+;; Any -> Boolean
+(define (compile-string s)
+  (let ((l (string-length s))
+        (c0 (break-string (string->list s))))
+    `((mov rax ,l)
+      (sal rax ,imm-shift)
+      (mov (offset rdi 0) rax)
+      (mov rax rdi)
+      (or rax ,type-string)
+      (add rdi 8)
+      ,@c0)))
+
+(define (break-string s)
+  (match s
+    ['() '()]
+    [(cons c cs)
+     (let ((c0 (break-string cs)))
+       `((mov rbx ,(char->integer c))
+         (sal rbx ,imm-shift)
+         (or rbx ,imm-type-char)
+         (mov (offset rdi 0) rbx)
+         (add rdi 8)
+         ,@c0))]))
+  
+(define (compile-string-ref e0 e1 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 (cons #f c)))
+        (l0 (gensym)))
+    `(,@c0
+      ,@(assert-string)
+      (mov (offset rsp ,(- (add1 (length c)))) rax)
+      ,@c1
+      ,@(assert-integer)
+      (sar rax ,imm-shift) ;detag integer index
+      (mov rbx (offset rsp ,(- (add1 (length c))))) ;get the string pointer
+      (xor rbx ,type-string) ;detag the string pointer
+      (mov rbx (offset rbx 0)) ;get the length
+      (sar rbx ,imm-shift) ;detag the length int
+      (cmp rbx 0) ;make sure the string isn't empty
+      (je err) ;if string is empty there is no index
+      (cmp rax rbx) ;make sure the index is less than the length (0 indexing)
+      (jge err)
+      (cmp rax 0) ;make sure the index isnt lower than 0
+      (jl err)
+      (mov rbx (offset rsp ,(- (add1 (length c))))) ;move the string pointer back into rbx
+      (xor rbx ,type-string) ;detag
+      ,l0
+      (add rbx 8) ;move down the string
+      (sub rax 1) ;one index down
+      (cmp rax 0) ;check if any index is still left over or if we've gone below zero
+      (jge ,l0)
+      (mov rax (offset rbx 0))))) ;get the char
+
+(define (compile-string-length e0 c)
+  (let ((c0 (compile-e e0 c)))
+    `(,@c0
+      ,@(assert-string)
+      (xor rax ,type-string)
+      (mov rax (offset rax 0)))))
+
+(define (compile-make-string e0 e1 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 (cons #f c)))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      ,@(assert-integer)
+      (mov (offset rsp ,(- (add1 (length c)))) rax) ;push length we want
+      ,@c1
+      ,@(assert-char)
+      (mov rbx (offset rsp ,(- (add1 (length c))))) ;pop the length back
+      (mov (offset rsp ,(- (add1 (length c)))) rdi) ;push current heap location
+      (mov (offset rdi 0) rbx) ;put the length in the pointer address
+      (add rdi 8) ;allocate heap space
+      (sar rbx ,imm-shift) ;detag length integer
+      (cmp rbx 0)
+      (jl err) ;cannot be less than 0
+      ,l0
+      (cmp rbx 0) ;do we still have to add chars
+      (je ,l1)
+      (mov (offset rdi 0) rax) ;put char in str
+      (add rdi 8) ;allocate heap space
+      (sub rbx 1) ;one less char to string
+      (jmp ,l0)
+      ,l1
+      (mov rax (offset rsp ,(- (add1 (length c)))))
+      (or rax ,type-string))))
+
+(define (compile-box? e0 c)
+  (let ((c0 (compile-e e0 c))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      (mov rbx rax)
+      (and rbx ,(type-pred->mask 'box?))
+      (cmp rbx ,(type-pred->tag 'box?))
+      (jne ,l0)
+      (mov rax ,imm-val-true)
+      (jmp ,l1)
+      ,l0
+      (mov rax ,imm-val-false)
+      ,l1)))
+
+(define (compile-empty? e0 c)
+  (let ((c0 (compile-e e0 c))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      (mov rbx rax)
+      (and rbx ,(type-pred->mask 'empty?))
+      (cmp rbx ,(type-pred->tag 'empty?))
+      (jne ,l0)
+      (mov rax ,imm-val-true)
+      (jmp ,l1)
+      ,l0
+      (mov rax ,imm-val-false)
+      ,l1)))
+
+(define (compile-cons? e0 c)
+  (let ((c0 (compile-e e0 c))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      (mov rbx rax)
+      (and rbx ,(type-pred->mask 'cons?))
+      (cmp rbx ,(type-pred->tag 'cons?))
+      (jne ,l0)
+      (mov rax ,imm-val-true)
+      (jmp ,l1)
+      ,l0
+      (mov rax ,imm-val-false)
+      ,l1)))
+
+(define (compile-= e0 e1 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 (cons #f c)))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      ,@(assert-integer)
+      (mov (offset rsp ,(- (add1 (length c)))) rax)
+      ,@c1
+      ,@(assert-integer)
+      (cmp rax (offset rsp ,(- (add1 (length c)))))
+      (jne ,l0)
+      (mov rax ,imm-val-true)
+      (jmp ,l1)
+      ,l0
+      (mov rax ,imm-val-false)
+      ,l1)))
+
+(define (compile-< e0 e1 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 (cons #f c)))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      ,@(assert-integer)
+      (mov (offset rsp ,(- (add1 (length c)))) rax)
+      ,@c1
+      ,@(assert-integer)
+      (cmp (offset rsp ,(- (add1 (length c)))) rax)
+      (jge ,l0)
+      (mov rax ,imm-val-true)
+      (jmp ,l1)
+      ,l0
+      (mov rax ,imm-val-false)
+      ,l1)))
+
+(define (compile-<= e0 e1 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 (cons #f c)))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      ,@(assert-integer)
+      (mov (offset rsp ,(- (add1 (length c)))) rax)
+      ,@c1
+      ,@(assert-integer)
+      (cmp (offset rsp ,(- (add1 (length c)))) rax)
+      (jg ,l0)
+      (mov rax ,imm-val-true)
+      (jmp ,l1)
+      ,l0
+      (mov rax ,imm-val-false)
+      ,l1)))
+
+(define (compile-char=? e0 e1 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 (cons #f c)))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      ,@(assert-char)
+      (mov (offset rsp ,(- (add1 (length c)))) rax)
+      ,@c1
+      ,@(assert-char)
+      (cmp rax (offset rsp ,(- (add1 (length c)))))
+      (jne ,l0)
+      (mov rax ,imm-val-true)
+      (jmp ,l1)
+      ,l0
+      (mov rax ,imm-val-false)
+      ,l1)))
+
+(define (compile-boolean=? e0 e1 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 (cons #f c)))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      ,@(assert-boolean)
+      (mov (offset rsp ,(- (add1 (length c)))) rax)
+      ,@c1
+      ,@(assert-boolean)
+      (cmp rax (offset rsp ,(- (add1 (length c)))))
+      (jne ,l0)
+      (mov rax ,imm-val-true)
+      (jmp ,l1)
+      ,l0
+      (mov rax ,imm-val-false)
+      ,l1)))
+  
+
+;; Any -> Boolean
+(define (imm? x)
+  (or (integer? x)
+      (boolean? x)
+      (char? x)
+      (equal? ''() x)))
+
+;; Any -> Boolean
+(define (type-pred? x)
+  (memq x '(integer?
+            char?
+            empty?
+            boolean?
+            box?
+            cons?)))
+
+;; Imm -> Asm
+(define (compile-imm i)
+  `((mov rax ,(imm->bits i))))
+
+;; Imm -> Integer
+(define (imm->bits i)
+  (match i
+    [(? integer? i) (arithmetic-shift i imm-shift)]
+    [(? char? c)    (+ (arithmetic-shift (char->integer c) imm-shift) imm-type-char)]
+    [(? boolean? b) (if b imm-val-true imm-val-false)]
+    [''()           imm-type-empty]))
+
+
+
+
+;; Variable CEnv -> Asm
+(define (compile-var x c)
+  (let ((i (lookup x c)))
+    `((mov rax (offset rsp ,(- (add1 i)))))))
+
+;; Expr CEnv -> Asm
+(define (compile-box e0 c)
+  (let ((c0 (compile-e e0 c)))
+    `(,@c0
+      (mov (offset rdi 0) rax)
+      (mov rax rdi)
+      (or rax ,type-box)
+      (add rdi 8)))) ; allocate 8 bytes
+
+;; Expr CEnv -> Asm
+(define (compile-unbox e0 c)
+  (let ((c0 (compile-e e0 c)))
+    `(,@c0
+      ,@(assert-box)
+      (xor rax ,type-box)
+      (mov rax (offset rax 0)))))
+
+;; Expr Expr CEnv -> Asm
+(define (compile-cons e0 e1 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 (cons #f c))))
+    `(,@c0
+      (mov (offset rsp ,(- (add1 (length c)))) rax)
+      ,@c1
+      (mov (offset rdi 0) rax)
+      (mov rax (offset rsp ,(- (add1 (length c)))))
+      (mov (offset rdi 1) rax)
+      (mov rax rdi)
+      (or rax ,type-pair)
+      (add rdi 16))))
+
+;; Expr CEnv -> Asm
+(define (compile-car e0 c)
+  (let ((c0 (compile-e e0 c)))
+    `(,@c0
+      ,@(assert-pair)
+      (xor rax ,type-pair) ; untag
+      (mov rax (offset rax 1)))))
+
+;; Expr CEnv -> Asm
+(define (compile-cdr e0 c)
+  (let ((c0 (compile-e e0 c)))
+    `(,@c0
+      ,@(assert-pair)
+      (xor rax ,type-pair) ; untag
+      (mov rax (offset rax 0)))))
+
+;; Expr CEnv -> Asm
+(define (compile-add1 e0 c)
+  (let ((c0 (compile-e e0 c)))
+    `(,@c0
+      ,@(assert-integer)
+      (add rax ,(arithmetic-shift 1 imm-shift)))))
+
+;; Expr CEnv -> Asm
+(define (compile-sub1 e0 c)
+  (let ((c0 (compile-e e0 c)))
+    `(,@c0
+      ,@(assert-integer)
+      (sub rax ,(arithmetic-shift 1 imm-shift)))))
+
+;; Expr CEnv -> Asm
+(define (compile-zero? e0 c)
+  (let ((c0 (compile-e e0 c))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      ,@(assert-integer)
+      (cmp rax 0)
+      (mov rax ,imm-val-false)
+      (jne ,l0)
+      (mov rax ,imm-val-true)
+      ,l0)))
+
+;; Expr Expr Expr CEnv -> Asm
+(define (compile-if e0 e1 e2 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 c))
+        (c2 (compile-e e2 c))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      (cmp rax ,imm-val-false)
+      (je ,l0)
+      ,@c1
+      (jmp ,l1)
+      ,l0
+      ,@c2
+      ,l1)))
+
+;; Expr Expr CEnv -> Asm
+(define (compile-+ e0 e1 c)
+  (let ((c1 (compile-e e1 c))
+        (c0 (compile-e e0 (cons #f c))))
+    ;; FIXME this should really do the type check *after* both
+    ;; expression have executed
+    `(,@c1
+      ,@(assert-integer)
+      (mov (offset rsp ,(- (add1 (length c)))) rax)
+      ,@c0
+      ,@(assert-integer)
+      (add rax (offset rsp ,(- (add1 (length c))))))))
+
+(define (compile--1 e0 c)
+  (let ((c0 (compile-e e0 c)))
+    `(,@c0
+      ,@(assert-integer)
+      (neg rax))))
+
+(define (compile--2 e0 e1 c)
+  (let ((c0 (compile-e e0 c))
+        (c1 (compile-e e1 (cons #f c))))
+    `(,@c0
+      ,@(assert-integer)
+      (mov (offset rsp ,(- (add1 (length c)))) rax)
+      ,@c1
+      ,@(assert-integer)
+      (sub rax (offset rsp ,(- (add1 (length c)))))
+      (neg rax))))
+
+(define (compile-abs e0 c)
+  (let ((c0 (compile-e e0 c)))
+       `(,@c0
+         ,@(assert-integer)
+         (mov rbx rax)
+         (neg rax)
+         (cmovl rax rbx))))
+
+;; (Listof (List Expr Expr)) Expr CEnv -> Asm
+(define (compile-cond-env cs en c)
+  (match cs
+    ['() (compile-e en c)]
+    [(cons `(,eq ,ea) cs)
+     (let ((c0 (compile-e eq c))
+           (c1 (compile-e ea c))
+           (c2 (compile-cond-env cs en c))
+           (l0 (gensym "if"))
+           (l1 (gensym "if")))
+       `(,@c0
+         (cmp rax ,imm-val-false)
+         (je, l0)
+         ,@c1
+         (jmp, l1)
+         ,l0
+         ,@c2
+         ,l1))]))
+
+(define (compile-integer? e0 c)
+  (let ((c0 (compile-e e0 c))
+           (l0 (gensym))
+           (l1 (gensym)))
+       `(,@c0
+         (mov rbx rax)
+         (and rbx ,imm-type-mask)
+         (cmp rbx 0)
+         (jne ,l0)
+         (mov rax ,imm-val-true)
+         (jmp ,l1)
+         ,l0
+         (mov rax ,imm-val-false)
+         ,l1)))
+
+(define (compile-boolean? e0 c)
+  (let ((c0 (compile-e e0 c))
+           (l0 (gensym))
+           (l1 (gensym)))
+       `(,@c0
+         (and rax ,imm-type-mask)
+         (cmp rax ,imm-type-bool)
+         (je ,l0)
+         (mov rax ,imm-val-false)
+         (jmp ,l1)
+         ,l0
+         (mov rax ,imm-val-true)
+         ,l1)))
+
+(define (compile-char? e0 c)
+  (let ((c0 (compile-e e0 c))
+           (l0 (gensym))
+           (l1 (gensym)))
+       `(,@c0
+         (mov rbx rax)
+         (and rbx ,imm-type-mask)
+         (cmp rbx ,imm-type-char)
+         (je ,l0)
+         (mov rax ,imm-val-false)
+         (jmp ,l1)
+         ,l0
+         (mov rax ,imm-val-true)
+         ,l1)))
+
+(define (compile-integer->char e0 c)
+  (let ((c0 (compile-e e0 c))
+           (l0 (gensym)))
+       `(,@c0
+         ,@(assert-integer)
+         (mov rbx rax)
+         (sar rbx ,imm-shift)
+         (cmp rbx -1)
+         (jle err)
+         (cmp rbx #xD7FF)
+         (jle ,l0)
+         (cmp rbx #xDFFF)
+         (jle err)
+         (cmp rbx #x110000)
+         (jge err)
+         ,l0
+         (xor rax ,imm-type-char))))
+
+(define (compile-char->integer e0 c)
+  (let ((c0 (compile-e e0 c)))
+       `(,@c0
+         ,@(assert-char)
+         (sar rax ,imm-shift)
+         (sal rax ,imm-shift))))
+
+(define (compile-bindings bs e c)
+  (match bs
+    ['() (compile-e e c)]
+    [(cons (list v e0) bs)
+     (let ((c0 (compile-e e0 c))
+           (c1 (compile-bindings bs e (cons v c))))
+       `(,@c0
+         (mov (offset rsp ,(- (add1 (length c)))) rax)
+         ,@c1))]))
+
+(define (compile-string? e0 c)
+  (let ((c0 (compile-e e0 c))
+        (l0 (gensym))
+        (l1 (gensym)))
+    `(,@c0
+      (mov rbx rax)
+      (and rbx ,(type-pred->mask 'string?))
+      (cmp rbx ,(type-pred->tag 'string?))
+      (jne ,l0)
+      (mov rax ,imm-val-true)
+      (jmp ,l1)
+      ,l0
+      (mov rax ,imm-val-false)
+      ,l1)))
+      
+
+
+;; Variable CEnv -> Natural
+(define (lookup x cenv)
+  (match cenv
+    ['() (error "undefined variable:" x)]
+    [(cons y cenv)
+     (match (eq? x y)
+       [#t (length cenv)]
+       [#f (lookup x cenv)])]))
+
+(define (assert-type p)
+  `((mov rbx rax)
+    (and rbx ,(type-pred->mask p))
+    (cmp rbx ,(type-pred->tag p))
+    (jne err)))
+
+
+(define (type-pred->mask p)
+    (match p
+      [(or 'box? 'cons? 'string? 'pair?) result-type-mask]
+      [_ imm-type-mask]))
+
+(define (type-pred->tag p)
+    (match p
+      ['box?     type-box]
+      ['cons?    type-pair]
+      ['string?  type-string]
+      ['integer? imm-type-int]
+      ['empty?   imm-type-empty]
+      ['char?    imm-type-char]
+      ['boolean? imm-type-bool]
+      ['pair?    type-pair]))
+
+(define (assert-integer) (assert-type 'integer?))
+(define (assert-box)     (assert-type 'box?))
+(define (assert-pair)    (assert-type 'pair?))
+(define (assert-char)    (assert-type 'char?))
+(define (assert-string)  (assert-type 'string?))
+(define (assert-boolean) (assert-type 'boolean?))
+(define (assert-empty)   (assert-type 'empty?))
+(define (assert-cons)    (assert-type 'cons?))
+
+
